@@ -1,0 +1,72 @@
+services:
+  spark:
+    image: bitnami/spark:3.5
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./data:/data
+      - ./src:/src
+    networks:
+      - taxi-network
+
+  postgres-airflow:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
+    networks:
+      - taxi-network
+
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    depends_on:
+      - postgres-airflow
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+    command: bash -c "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com; airflow webserver"
+    networks:
+      - taxi-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    depends_on:
+      - airflow-webserver
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+    command: bash -c "airflow db migrate && airflow scheduler"
+    networks:
+      - taxi-network
+
+  dashboard:
+    image: python:3.11-slim
+    depends_on:
+      - spark
+    ports:
+      - "8501:8501"
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+      - ./data:/app/data
+    command: bash -c "pip install -r /app/requirements.txt && streamlit run app.py --server.port=8501 --server.address=0.0.0.0"
+    networks:
+      - taxi-network
+
+networks:
+  taxi-network:
+    driver: bridge
