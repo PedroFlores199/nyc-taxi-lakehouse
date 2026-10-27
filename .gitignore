@@ -1,12 +1,8 @@
-*.py[cod]
-*$py.class
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
 
 .env
 .venv/
@@ -14,14 +10,19 @@ venv/
 
 .pytest_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
-data/bronze/
-data/silver/
-data/gold/
+data/*
+!data/.gitkeep
+!data/spark-events/
+data/spark-events/*
+!data/spark-events/.gitkeep
 
 spark-warehouse/
 metastore_db/
 derby.log
 
-airflow-data/
 logs/
+.DS_Store

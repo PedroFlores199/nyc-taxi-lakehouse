@@ -1,0 +1,34 @@
+{
+  "$jsonSchema": {
+    "bsonType": "object",
+    "required": ["_id", "origen", "destino", "viajes", "franjas", "actualizado_en"],
+    "properties": {
+      "_id": {"bsonType": "string", "pattern": "^[0-9]+-[0-9]+$"},
+      "origen": {"bsonType": "int"},
+      "destino": {"bsonType": "int"},
+      "origen_nombre": {"bsonType": "string"},
+      "destino_nombre": {"bsonType": "string"},
+      "viajes": {"bsonType": "long", "minimum": 1},
+      "duracion_media_min": {"bsonType": "double", "minimum": 0},
+      "importe_medio": {"bsonType": "double"},
+      "distancia_media_millas": {"bsonType": "double", "minimum": 0},
+      "franjas": {
+        "bsonType": "array",
+        "minItems": 1,
+        "maxItems": 5,
+        "items": {
+          "bsonType": "object",
+          "required": ["franja", "viajes", "duracion_media_min", "importe_medio"],
+          "properties": {
+            "franja": {"enum": ["madrugada", "punta_manana", "mediodia", "punta_tarde", "noche"]},
+            "viajes": {"bsonType": "long", "minimum": 1},
+            "duracion_media_min": {"bsonType": "double", "minimum": 0},
+            "importe_medio": {"bsonType": "double"},
+            "distancia_media_millas": {"bsonType": "double", "minimum": 0}
+          }
+        }
+      },
+      "actualizado_en": {"bsonType": "date"}
+    }
+  }
+}

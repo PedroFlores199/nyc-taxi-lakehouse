@@ -1,0 +1,37 @@
+{
+  "$jsonSchema": {
+    "bsonType": "object",
+    "required": [
+      "_id",
+      "mes",
+      "fecha_recogida",
+      "fecha_llegada",
+      "zona_origen_id",
+      "zona_destino_id",
+      "distancia_millas",
+      "tarifa",
+      "importe_total",
+      "importe_por_milla",
+      "media_trayecto",
+      "desviacion_trayecto",
+      "puntuacion_z",
+      "cargado_en"
+    ],
+    "properties": {
+      "_id": {"bsonType": "long"},
+      "mes": {"bsonType": "string", "pattern": "^[0-9]{4}-[0-9]{2}$"},
+      "fecha_recogida": {"bsonType": "date"},
+      "fecha_llegada": {"bsonType": "date"},
+      "zona_origen_id": {"bsonType": "int"},
+      "zona_destino_id": {"bsonType": "int"},
+      "distancia_millas": {"bsonType": "double", "minimum": 0, "exclusiveMinimum": true},
+      "tarifa": {"bsonType": "double", "minimum": 0},
+      "importe_total": {"bsonType": "double", "minimum": 0},
+      "importe_por_milla": {"bsonType": "double"},
+      "media_trayecto": {"bsonType": "double"},
+      "desviacion_trayecto": {"bsonType": "double", "minimum": 0, "exclusiveMinimum": true},
+      "puntuacion_z": {"bsonType": "double", "minimum": 3},
+      "cargado_en": {"bsonType": "date"}
+    }
+  }
+}

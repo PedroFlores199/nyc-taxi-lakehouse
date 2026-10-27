@@ -1,0 +1,76 @@
+{
+  "$jsonSchema": {
+    "bsonType": "object",
+    "required": ["_id", "nombre", "distrito", "actualizado_en"],
+    "properties": {
+      "_id": {"bsonType": "int", "minimum": 1},
+      "nombre": {"bsonType": "string"},
+      "distrito": {"bsonType": "string"},
+      "zona_servicio": {"bsonType": "string"},
+      "geometria": {
+        "bsonType": "object",
+        "required": ["type", "coordinates"],
+        "properties": {
+          "type": {"enum": ["MultiPolygon"]},
+          "coordinates": {"bsonType": "array", "minItems": 1}
+        }
+      },
+      "centroide": {
+        "bsonType": "object",
+        "required": ["type", "coordinates"],
+        "properties": {
+          "type": {"enum": ["Point"]},
+          "coordinates": {
+            "bsonType": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {"bsonType": "double"}
+          }
+        }
+      },
+      "demanda": {
+        "bsonType": "array",
+        "maxItems": 168,
+        "items": {
+          "bsonType": "object",
+          "required": ["dia_semana", "hora", "viajes"],
+          "properties": {
+            "dia_semana": {"bsonType": "int", "minimum": 1, "maximum": 7},
+            "hora": {"bsonType": "int", "minimum": 0, "maximum": 23},
+            "viajes": {"bsonType": "long", "minimum": 1},
+            "importe_medio": {"bsonType": "double"},
+            "propina_media_pct": {"bsonType": "double"}
+          }
+        }
+      },
+      "resumen_mensual": {
+        "bsonType": "array",
+        "items": {
+          "bsonType": "object",
+          "required": ["mes", "viajes"],
+          "properties": {
+            "mes": {"bsonType": "string", "pattern": "^[0-9]{4}-[0-9]{2}$"},
+            "viajes": {"bsonType": "long", "minimum": 1},
+            "importe_medio": {"bsonType": "double"},
+            "propina_media_pct": {"bsonType": "double"}
+          }
+        }
+      },
+      "top_destinos": {
+        "bsonType": "array",
+        "maxItems": 5,
+        "items": {
+          "bsonType": "object",
+          "required": ["viajes", "zona_id"],
+          "properties": {
+            "viajes": {"bsonType": "long", "minimum": 1},
+            "zona_id": {"bsonType": "int"},
+            "nombre": {"bsonType": "string"},
+            "distrito": {"bsonType": "string"}
+          }
+        }
+      },
+      "actualizado_en": {"bsonType": "date"}
+    }
+  }
+}

@@ -1,9 +1,10 @@
 pyspark==3.5.3
-requests==2.32.3
-streamlit==1.40.2
-plotly==5.24.1
-folium==0.18.0
-streamlit-folium==0.23.1
+numpy==1.26.4
 pandas==2.2.3
-great-expectations==1.2.6
-apache-airflow==2.8.1
+pyarrow==18.1.0
+pymongo==4.10.1
+psycopg2-binary==2.9.10
+holidays==0.62
+pyshp==2.3.1
+pyproj==3.7.0
+shapely==2.0.6

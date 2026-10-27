@@ -1,0 +1,32 @@
+[project]
+name = "nyc-taxi-lakehouse"
+version = "1.0.0"
+description = "Data lake medallion con PySpark, PostgreSQL y MongoDB sobre los taxis de Nueva York"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["data"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "N", "C4", "RUF"]
+ignore = ["N812"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Query", "fastapi.Depends"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "api", "dashboard", "tests", "benchmarks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::Warning:holidays.*",
+    "ignore::DeprecationWarning:pyspark.*",
+    "ignore::DeprecationWarning:starlette.*",
+]
+
+[tool.coverage.run]
+source = ["src", "api"]

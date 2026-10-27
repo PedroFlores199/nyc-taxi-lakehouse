@@ -4,23 +4,54 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
-  test:
-    name: Test Suite
+  lint:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: pip install ruff==0.8.4
+      - run: ruff check .
+      - run: ruff format --check .
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
-
-      - name: Run tests
-        run: pytest -v
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: taxi
+          POSTGRES_PASSWORD: taxi
+          POSTGRES_DB: taxi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U taxi -d taxi_test"
+          --health-interval 5s
+          --health-retries 20
+    env:
+      MONGO_TEST_URI: mongodb://localhost:27017
+      POSTGRES_TEST_DSN: host=localhost port=5432 dbname=taxi_test user=taxi password=taxi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            api/requirements.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest --cov --cov-report=term-missing

@@ -1,72 +1,147 @@
-services:
-  spark:
-    image: bitnami/spark:3.5
-    ports:
-      - "8080:8080"
-      - "7077:7077"
-    volumes:
-      - ./data:/data
-      - ./src:/src
-    networks:
-      - taxi-network
+x-app-env: &app-env
+  TZ: UTC
+  MONGO_URI: mongodb://mongodb:27017
+  MONGO_DB: ${MONGO_DB:-nyc_taxi}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-taxi}
+  POSTGRES_USER: ${POSTGRES_USER:-taxi}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taxi}
 
-  postgres-airflow:
+x-airflow: &airflow
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: nyc-taxi-lakehouse/airflow:latest
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment:
+    <<: *app-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-taxi}:${POSTGRES_PASSWORD:-taxi}@postgres:5432/airflow
+    PYTHONPATH: /opt/airflow
+    DATA_PATH: /opt/airflow/data
+    LAKE_FORMAT: ${LAKE_FORMAT:-parquet}
+    SPARK_MASTER: local[*]
+    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-3g}
+    SPARK_SHUFFLE_PARTITIONS: "8"
+    SPARK_EVENT_LOG_DIR: /opt/airflow/data/spark-events
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./sql:/opt/airflow/sql
+    - ./mongo:/opt/airflow/mongo
+    - ./data:/opt/airflow/data
+
+services:
+  postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_DB: ${POSTGRES_DB:-taxi}
+      POSTGRES_USER: ${POSTGRES_USER:-taxi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taxi}
     ports:
-      - "5433:5432"
-    networks:
-      - taxi-network
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-taxi} -d ${POSTGRES_DB:-taxi}"]
+      interval: 5s
+      retries: 20
+
+  mongodb:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      retries: 20
+
+  spark-history:
+    image: apache/spark:3.5.3
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    user: "185:0"
+    environment:
+      SPARK_HISTORY_OPTS: -Dspark.history.fs.logDirectory=/opt/spark-events
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./data/spark-events:/opt/spark-events:ro
+
+  airflow-init:
+    <<: *airflow
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users list | grep -qw "${AIRFLOW_ADMIN_USER:-admin}" || airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Admin --lastname Lakehouse --role Admin --email admin@example.com
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   airflow-webserver:
-    image: apache/airflow:2.8.1
-    depends_on:
-      - postgres-airflow
+    <<: *airflow
+    command: webserver
     ports:
-      - "8081:8080"
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./data:/opt/airflow/data
-    environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
-    command: bash -c "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com; airflow webserver"
-    networks:
-      - taxi-network
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      retries: 10
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
 
   airflow-scheduler:
-    image: apache/airflow:2.8.1
+    <<: *airflow
+    command: scheduler
     depends_on:
-      - airflow-webserver
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./data:/opt/airflow/data
+      airflow-init:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
-    command: bash -c "airflow db migrate && airflow scheduler"
-    networks:
-      - taxi-network
+      <<: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
 
   dashboard:
-    image: python:3.11-slim
-    depends_on:
-      - spark
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    environment:
+      <<: *app-env
     ports:
       - "8501:8501"
-    working_dir: /app
-    volumes:
-      - ./dashboard:/app
-      - ./data:/app/data
-    command: bash -c "pip install -r /app/requirements.txt && streamlit run app.py --server.port=8501 --server.address=0.0.0.0"
-    networks:
-      - taxi-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
 
-networks:
-  taxi-network:
-    driver: bridge
+volumes:
+  postgres-data:
+  mongo-data:

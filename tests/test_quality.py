@@ -2,106 +2,76 @@ from datetime import datetime
 
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.types import (
-    DoubleType,
-    IntegerType,
-    StructField,
-    StructType,
-    TimestampType,
+
+from src.quality.checks import (
+    DataQualityError,
+    between,
+    check_unique,
+    enforce,
+    evaluate,
+    greater_than,
+    not_null,
+    validate_gold,
+    validate_silver,
 )
-
-from src.quality.checks import check_no_duplicates, check_no_nulls, check_valid_ranges
-
-
-TRIP_SCHEMA = StructType([
-    StructField("VendorID", IntegerType(), False),
-    StructField("tpep_pickup_datetime", TimestampType(), False),
-    StructField("tpep_dropoff_datetime", TimestampType(), False),
-    StructField("passenger_count", IntegerType(), True),
-    StructField("trip_distance", DoubleType(), False),
-    StructField("PULocationID", IntegerType(), False),
-    StructField("DOLocationID", IntegerType(), False),
-    StructField("fare_amount", DoubleType(), False),
-    StructField("tip_amount", DoubleType(), False),
-    StructField("total_amount", DoubleType(), False),
-])
+from tests.factories import silver_trip, silver_trips
 
 
-def _clean_row(overrides: dict | None = None) -> dict:
-    defaults = {
-        "VendorID": 1,
-        "tpep_pickup_datetime": datetime(2024, 1, 15, 10, 0, 0),
-        "tpep_dropoff_datetime": datetime(2024, 1, 15, 10, 30, 0),
-        "passenger_count": 1,
-        "trip_distance": 5.0,
-        "PULocationID": 100,
-        "DOLocationID": 200,
-        "fare_amount": 25.0,
-        "tip_amount": 5.0,
-        "total_amount": 30.0,
-    }
-    if overrides:
-        defaults.update(overrides)
-    return defaults
+def test_not_null_counts_failing_rows(spark: SparkSession) -> None:
+    df = spark.createDataFrame([(1, None), (2, "b"), (None, None)], "id int, name string")
+    results = {result.name: result for result in evaluate(df, not_null("id", "name"))}
+    assert results["id sin nulos"].failing_rows == 1
+    assert results["name sin nulos"].failing_rows == 2
+    assert results["tabla no vacía"].passed
 
 
-def test_no_nulls_passes_clean_data(spark: SparkSession) -> None:
-    df = spark.createDataFrame([_clean_row()], schema=TRIP_SCHEMA)
-    assert check_no_nulls(df, ["VendorID", "trip_distance", "fare_amount"]) is True
+def test_between_and_greater_than(spark: SparkSession) -> None:
+    df = spark.createDataFrame([(0.0,), (5.0,), (101.0,)], "distance double")
+    results = evaluate(df, [between("distance", 0, 100), greater_than("distance", 0)])
+    assert [result.failing_rows for result in results[:2]] == [1, 1]
 
 
-def test_no_nulls_fails_with_nulls(spark: SparkSession) -> None:
-    df = spark.createDataFrame(
-        [_clean_row({"passenger_count": None})],
-        schema=TRIP_SCHEMA,
-    )
-    with pytest.raises(ValueError):
-        check_no_nulls(df, ["passenger_count"])
+def test_empty_table_fails(spark: SparkSession) -> None:
+    df = spark.createDataFrame([], "id int")
+    assert not evaluate(df, not_null("id"))[-1].passed
 
 
-def test_valid_ranges_passes(spark: SparkSession) -> None:
-    df = spark.createDataFrame([_clean_row()], schema=TRIP_SCHEMA)
-    assert check_valid_ranges(df) is True
+def test_check_unique(spark: SparkSession) -> None:
+    df = spark.createDataFrame([(1,), (1,), (2,)], "id int")
+    assert check_unique(df, ["id"]).failing_rows == 1
 
 
-def test_valid_ranges_fails_negative_distance(spark: SparkSession) -> None:
-    schema_nullable = StructType([
-        StructField("VendorID", IntegerType(), True),
-        StructField("tpep_pickup_datetime", TimestampType(), True),
-        StructField("tpep_dropoff_datetime", TimestampType(), True),
-        StructField("passenger_count", IntegerType(), True),
-        StructField("trip_distance", DoubleType(), True),
-        StructField("PULocationID", IntegerType(), True),
-        StructField("DOLocationID", IntegerType(), True),
-        StructField("fare_amount", DoubleType(), True),
-        StructField("tip_amount", DoubleType(), True),
-        StructField("total_amount", DoubleType(), True),
-    ])
-    df = spark.createDataFrame(
-        [_clean_row({"trip_distance": -3.0})],
-        schema=schema_nullable,
-    )
-    with pytest.raises(ValueError):
-        check_valid_ranges(df)
+def test_enforce_raises_with_all_failures(spark: SparkSession) -> None:
+    df = spark.createDataFrame([(None,), (None,)], "id int")
+    with pytest.raises(DataQualityError) as error:
+        enforce("tabla", [*evaluate(df, not_null("id")), check_unique(df, ["id"])])
+    assert {failure.name for failure in error.value.failures} == {"id sin nulos", "sin duplicados en id"}
 
 
-def test_no_duplicates_passes(spark: SparkSession) -> None:
-    df = spark.createDataFrame(
-        [
-            _clean_row({"VendorID": 1, "tpep_pickup_datetime": datetime(2024, 1, 15, 10, 0, 0)}),
-            _clean_row({"VendorID": 2, "tpep_pickup_datetime": datetime(2024, 1, 15, 11, 0, 0)}),
-        ],
-        schema=TRIP_SCHEMA,
-    )
-    assert check_no_duplicates(
-        df, ["VendorID", "tpep_pickup_datetime", "PULocationID", "DOLocationID"]
-    ) is True
+def test_validate_silver_accepts_clean_data(spark: SparkSession) -> None:
+    validate_silver(silver_trips(spark, [silver_trip(trip_id="a"), silver_trip(trip_id="b")]))
 
 
-def test_no_duplicates_fails(spark: SparkSession) -> None:
-    row = _clean_row()
-    df = spark.createDataFrame([row, row], schema=TRIP_SCHEMA)
-    with pytest.raises(ValueError):
-        check_no_duplicates(
-            df, ["VendorID", "tpep_pickup_datetime", "PULocationID", "DOLocationID"]
-        )
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"trip_distance": 0.0}, id="distancia_cero"),
+        pytest.param({"passenger_count": 9}, id="pasajeros"),
+        pytest.param({"fare_amount": -1.0}, id="importe_negativo"),
+        pytest.param({"pickup_borough": None}, id="distrito_nulo"),
+        pytest.param({"duration_minutes": 400.0}, id="duracion"),
+    ],
+)
+def test_validate_silver_stops_on_bad_data(spark: SparkSession, overrides: dict) -> None:
+    with pytest.raises(DataQualityError):
+        validate_silver(silver_trips(spark, [silver_trip(trip_id="a", **overrides)]))
+
+
+def test_validate_silver_rejects_duplicated_ids(spark: SparkSession) -> None:
+    trips = [silver_trip(trip_id="a"), silver_trip(trip_id="a", pickup=datetime(2024, 1, 16, 11))]
+    with pytest.raises(DataQualityError):
+        validate_silver(silver_trips(spark, trips))
+
+
+def test_validate_gold_allows_empty_anomalies(spark: SparkSession) -> None:
+    validate_gold("gold.anomalies", spark.createDataFrame([], "trip_id string"), ["trip_id"], (), True)

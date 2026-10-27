@@ -1,0 +1,16 @@
+{
+  "zonas": [
+    {"name": "geometria_2dsphere", "keys": [["geometria", "2dsphere"]]},
+    {"name": "centroide_2dsphere", "keys": [["centroide", "2dsphere"]]},
+    {"name": "distrito", "keys": [["distrito", 1]]}
+  ],
+  "trayectos": [
+    {"name": "origen_destino", "keys": [["origen", 1], ["destino", 1]], "unique": true}
+  ],
+  "anomalias": [
+    {"name": "ttl_90_dias", "keys": [["cargado_en", 1]], "expireAfterSeconds": 7776000},
+    {"name": "fecha_recogida", "keys": [["fecha_recogida", -1], ["_id", 1]]},
+    {"name": "zona_origen_mes", "keys": [["zona_origen_id", 1], ["mes", 1]]}
+  ],
+  "modelos": []
+}

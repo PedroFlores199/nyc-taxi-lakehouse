@@ -1,214 +1,252 @@
+import json
+import logging
+from collections.abc import Iterable
 from datetime import date
+from pathlib import Path
 
-from pyspark.sql import DataFrame, SparkSession
+import holidays
+from pyspark import StorageLevel
+from pyspark.sql import Column, DataFrame, Row, SparkSession, Window
 from pyspark.sql import functions as F
-from pyspark.sql import types as T
 
+from src.config import Settings
+from src.domain import TIME_SLOTS, YearMonth
+from src.lake import (
+    SILVER_TRIPS,
+    ZONE_SHAPEFILE_FILE,
+    bronze_trip_file,
+    bronze_zone_file,
+    read_zone_lookup,
+    silver_table,
+    write_table,
+    zone_geojson_file,
+)
+from src.quality.checks import validate_silver
+from src.transform.zones import (
+    shapefile_to_feature_collection,
+    standardize_zones,
+    write_feature_collection,
+)
 
-US_FEDERAL_HOLIDAYS: set[date] = {
-    date(2023, 1, 1),
-    date(2023, 1, 2),
-    date(2023, 1, 16),
-    date(2023, 2, 20),
-    date(2023, 5, 29),
-    date(2023, 6, 19),
-    date(2023, 7, 4),
-    date(2023, 9, 4),
-    date(2023, 10, 9),
-    date(2023, 11, 10),
-    date(2023, 11, 23),
-    date(2023, 12, 25),
-    date(2024, 1, 1),
-    date(2024, 1, 15),
-    date(2024, 2, 19),
-    date(2024, 5, 27),
-    date(2024, 6, 19),
-    date(2024, 7, 4),
-    date(2024, 9, 2),
-    date(2024, 10, 14),
-    date(2024, 11, 11),
-    date(2024, 11, 28),
-    date(2024, 12, 25),
+logger = logging.getLogger(__name__)
+
+RAW_COLUMNS: dict[str, tuple[str, str]] = {
+    "VendorID": ("vendor_id", "int"),
+    "tpep_pickup_datetime": ("pickup_datetime", "timestamp"),
+    "tpep_dropoff_datetime": ("dropoff_datetime", "timestamp"),
+    "passenger_count": ("passenger_count", "int"),
+    "trip_distance": ("trip_distance", "double"),
+    "PULocationID": ("pickup_location_id", "int"),
+    "DOLocationID": ("dropoff_location_id", "int"),
+    "payment_type": ("payment_type", "int"),
+    "fare_amount": ("fare_amount", "double"),
+    "tip_amount": ("tip_amount", "double"),
+    "tolls_amount": ("tolls_amount", "double"),
+    "total_amount": ("total_amount", "double"),
 }
 
-HOLIDAY_DATES_LIST: list[str] = [d.isoformat() for d in US_FEDERAL_HOLIDAYS]
+TRIP_ID_COLUMNS = (
+    "vendor_id",
+    "pickup_datetime",
+    "dropoff_datetime",
+    "pickup_location_id",
+    "dropoff_location_id",
+    "trip_distance",
+    "total_amount",
+)
+
+MAX_DURATION_MINUTES = 360
+MAX_DISTANCE_MILES = 100
+MAX_PASSENGERS = 6
+
+REASON_NULL_KEYS = "claves_nulas"
+REASON_OUT_OF_MONTH = "fecha_fuera_de_mes"
+REASON_DURATION = "duracion_invalida"
+REASON_DISTANCE = "distancia_invalida"
+REASON_AMOUNT = "importe_negativo"
+REASON_PASSENGERS = "pasajeros_invalidos"
+REASON_DUPLICATE = "duplicado"
 
 
-def remove_invalid_trips(df: DataFrame) -> tuple[DataFrame, DataFrame]:
-    duration_minutes = (
-        F.col("tpep_dropoff_datetime").cast("long")
-        - F.col("tpep_pickup_datetime").cast("long")
-    ) / 60.0
-
-    df_with_duration = df.withColumn("_duration_minutes", duration_minutes)
-
-    invalid_distance = (F.col("trip_distance") <= 0) | (F.col("trip_distance") > 100)
-    invalid_fare = F.col("fare_amount") < 0
-    invalid_passengers = (
-        F.col("passenger_count").isNull()
-        | (F.col("passenger_count") == 0)
-        | (F.col("passenger_count") > 6)
-    )
-    null_pickup = F.col("tpep_pickup_datetime").isNull()
-    null_dropoff = F.col("tpep_dropoff_datetime").isNull()
-    invalid_duration = (F.col("_duration_minutes") <= 0) | (F.col("_duration_minutes") > 360)
-
-    rejection_reason = (
-        F.when(null_pickup, F.lit("null_pickup_datetime"))
-        .when(null_dropoff, F.lit("null_dropoff_datetime"))
-        .when(invalid_distance, F.lit("invalid_trip_distance"))
-        .when(invalid_fare, F.lit("negative_fare_amount"))
-        .when(invalid_passengers, F.lit("invalid_passenger_count"))
-        .when(invalid_duration, F.lit("invalid_duration"))
-        .otherwise(F.lit(None))
+def standardize_columns(df: DataFrame) -> DataFrame:
+    return df.select(
+        [F.col(source).cast(dtype).alias(target) for source, (target, dtype) in RAW_COLUMNS.items()]
     )
 
-    df_tagged = df_with_duration.withColumn("rejection_reason", rejection_reason)
 
-    is_rejected = F.col("rejection_reason").isNotNull()
+def with_trip_id(df: DataFrame) -> DataFrame:
+    return df.withColumn("trip_id", F.xxhash64(*[F.col(column) for column in TRIP_ID_COLUMNS]))
 
-    valid = (
-        df_tagged
-        .filter(~is_rejected)
-        .drop("rejection_reason", "_duration_minutes")
+
+def duration_minutes() -> Column:
+    return (F.unix_timestamp("dropoff_datetime") - F.unix_timestamp("pickup_datetime")) / 60.0
+
+
+def rejection_rules(period: YearMonth) -> list[tuple[str, Column]]:
+    month_start = F.lit(period.first_day).cast("timestamp")
+    next_month_start = F.lit(period.next.first_day).cast("timestamp")
+    duration = duration_minutes()
+    return [
+        (
+            REASON_NULL_KEYS,
+            F.col("pickup_datetime").isNull()
+            | F.col("dropoff_datetime").isNull()
+            | F.col("pickup_location_id").isNull()
+            | F.col("dropoff_location_id").isNull(),
+        ),
+        (
+            REASON_OUT_OF_MONTH,
+            (F.col("pickup_datetime") < month_start) | (F.col("pickup_datetime") >= next_month_start),
+        ),
+        (REASON_DURATION, (duration <= 0) | (duration > MAX_DURATION_MINUTES)),
+        (
+            REASON_DISTANCE,
+            F.col("trip_distance").isNull()
+            | (F.col("trip_distance") <= 0)
+            | (F.col("trip_distance") > MAX_DISTANCE_MILES),
+        ),
+        (
+            REASON_AMOUNT,
+            F.col("fare_amount").isNull()
+            | F.col("total_amount").isNull()
+            | (F.col("fare_amount") < 0)
+            | (F.col("total_amount") < 0),
+        ),
+        (
+            REASON_PASSENGERS,
+            F.col("passenger_count").isNull()
+            | (F.col("passenger_count") == 0)
+            | (F.col("passenger_count") > MAX_PASSENGERS),
+        ),
+    ]
+
+
+def tag_rejections(df: DataFrame, period: YearMonth) -> DataFrame:
+    reason = F.lit(None).cast("string")
+    for name, condition in reversed(rejection_rules(period)):
+        reason = F.when(condition, F.lit(name)).otherwise(reason)
+    occurrence = Window.partitionBy("trip_id", "rejection_reason").orderBy("pickup_datetime")
+    return df.withColumn("rejection_reason", reason).withColumn(
+        "rejection_reason",
+        F.when(
+            F.col("rejection_reason").isNull() & (F.row_number().over(occurrence) > 1),
+            F.lit(REASON_DUPLICATE),
+        ).otherwise(F.col("rejection_reason")),
     )
 
-    rejected = (
-        df_tagged
-        .filter(is_rejected)
-        .drop("_duration_minutes")
-    )
 
+def split_valid_rejected(tagged: DataFrame) -> tuple[DataFrame, DataFrame]:
+    valid = tagged.filter(F.col("rejection_reason").isNull()).drop("rejection_reason")
+    rejected = tagged.filter(F.col("rejection_reason").isNotNull())
     return valid, rejected
 
 
-def add_calculated_columns(df: DataFrame) -> DataFrame:
-    duration_minutes = (
-        F.col("tpep_dropoff_datetime").cast("long")
-        - F.col("tpep_pickup_datetime").cast("long")
-    ) / 60.0
+def holidays_for(years: Iterable[int]) -> list[date]:
+    return sorted(holidays.country_holidays("US", subdiv="NY", years=sorted(set(years))))
 
-    duration_hours = duration_minutes / 60.0
 
+def time_slot(hour: Column) -> Column:
+    slot = F.lit(None).cast("string")
+    for name, start, end in reversed(TIME_SLOTS):
+        slot = F.when(hour.between(start, end), F.lit(name)).otherwise(slot)
+    return slot
+
+
+def add_derived_columns(df: DataFrame, holiday_dates: Iterable[date]) -> DataFrame:
+    duration = duration_minutes()
+    hour = F.hour("pickup_datetime")
     return (
-        df
-        .withColumn("duration_minutes", F.round(duration_minutes, 2))
+        df.withColumn("pickup_date", F.to_date("pickup_datetime"))
+        .withColumn("year_month", F.date_format("pickup_datetime", "yyyy-MM"))
+        .withColumn("pickup_hour", hour)
+        .withColumn("duration_minutes", F.round(duration, 2))
         .withColumn(
             "avg_speed_mph",
-            F.round(
-                F.when(duration_hours > 0, F.col("trip_distance") / duration_hours)
-                .otherwise(F.lit(0.0)),
-                2,
+            F.when(duration > 0, F.round(F.col("trip_distance") / (duration / 60.0), 2)),
+        )
+        .withColumn(
+            "tip_pct",
+            F.when(
+                F.col("fare_amount") > 0,
+                F.round(F.col("tip_amount") / F.col("fare_amount") * 100, 2),
             ),
         )
-        .withColumn(
-            "tip_percentage",
-            F.round(
-                F.when(
-                    F.col("fare_amount") > 0,
-                    F.col("tip_amount") / F.col("fare_amount") * 100,
-                ).otherwise(F.lit(0.0)),
-                2,
-            ),
+        .withColumn("time_slot", time_slot(hour))
+        .withColumn("day_of_week", ((F.dayofweek("pickup_datetime") + 5) % 7) + 1)
+        .withColumn("is_holiday", F.col("pickup_date").isin(list(holiday_dates)))
+    )
+
+
+def join_zones(trips: DataFrame, zones: DataFrame) -> DataFrame:
+    pickup = zones.select(
+        F.col("location_id").alias("pickup_location_id"),
+        F.col("zone").alias("pickup_zone"),
+        F.col("borough").alias("pickup_borough"),
+    )
+    dropoff = zones.select(
+        F.col("location_id").alias("dropoff_location_id"),
+        F.col("zone").alias("dropoff_zone"),
+        F.col("borough").alias("dropoff_borough"),
+    )
+    return trips.join(F.broadcast(pickup), "pickup_location_id", "left").join(
+        F.broadcast(dropoff), "dropoff_location_id", "left"
+    )
+
+
+def build_silver(raw: DataFrame, zones: DataFrame, period: YearMonth) -> tuple[DataFrame, DataFrame]:
+    tagged = tag_rejections(with_trip_id(standardize_columns(raw)), period)
+    valid, _ = split_valid_rejected(tagged)
+    enriched = join_zones(add_derived_columns(valid, holidays_for([period.year])), standardize_zones(zones))
+    return enriched, tagged
+
+
+def rejection_counts(tagged: DataFrame) -> DataFrame:
+    return tagged.groupBy("rejection_reason").count()
+
+
+def summarize_rejections(rows: Iterable[Row], period: YearMonth) -> dict:
+    counts = {row["rejection_reason"]: int(row["count"]) for row in rows}
+    valid = counts.pop(None, 0)
+    discarded = sum(counts.values())
+    return {
+        "mes": str(period),
+        "filas_leidas": valid + discarded,
+        "filas_validas": valid,
+        "filas_descartadas": discarded,
+        "motivos": dict(sorted(counts.items(), key=lambda item: (-item[1], item[0]))),
+    }
+
+
+def write_report(report: dict, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return destination
+
+
+def ensure_zone_geojson(settings: Settings) -> Path:
+    destination = zone_geojson_file(settings)
+    if destination.exists():
+        return destination
+    collection = shapefile_to_feature_collection(bronze_zone_file(settings, ZONE_SHAPEFILE_FILE))
+    return write_feature_collection(collection, destination)
+
+
+def run_silver(spark: SparkSession, settings: Settings, period: YearMonth) -> dict:
+    raw = spark.read.parquet(str(bronze_trip_file(settings, period)))
+    silver, tagged = build_silver(raw, read_zone_lookup(spark, settings), period)
+    tagged.persist(StorageLevel.MEMORY_AND_DISK)
+    try:
+        report = summarize_rejections(rejection_counts(tagged).collect(), period)
+        write_report(report, settings.reports_path / "silver" / f"{period}.json")
+        logger.info("Informe de descartes %s: %s", period, report)
+        validate_silver(silver)
+        write_table(
+            silver.repartition("pickup_date").sortWithinPartitions("pickup_datetime"),
+            silver_table(settings, SILVER_TRIPS),
+            settings,
+            partition_by=("pickup_date",),
         )
-        .withColumn(
-            "time_slot",
-            F.when(F.hour("tpep_pickup_datetime").between(0, 5), F.lit("MADRUGADA"))
-            .when(F.hour("tpep_pickup_datetime").between(6, 11), F.lit("MAÑANA"))
-            .when(F.hour("tpep_pickup_datetime").between(12, 17), F.lit("TARDE"))
-            .otherwise(F.lit("NOCHE")),
-        )
-        .withColumn("day_of_week", F.date_format("tpep_pickup_datetime", "EEEE"))
-        .withColumn(
-            "is_holiday",
-            F.to_date("tpep_pickup_datetime").cast("string").isin(HOLIDAY_DATES_LIST),
-        )
-    )
-
-
-def join_with_zones(df: DataFrame, zones_df: DataFrame) -> DataFrame:
-    pickup_zones = zones_df.select(
-        F.col("LocationID").alias("pu_location_id"),
-        F.col("Zone").alias("pickup_zone"),
-        F.col("Borough").alias("pickup_borough"),
-    )
-
-    dropoff_zones = zones_df.select(
-        F.col("LocationID").alias("do_location_id"),
-        F.col("Zone").alias("dropoff_zone"),
-        F.col("Borough").alias("dropoff_borough"),
-    )
-
-    return (
-        df
-        .join(
-            F.broadcast(pickup_zones),
-            df["PULocationID"] == pickup_zones["pu_location_id"],
-            "left",
-        )
-        .drop("pu_location_id")
-        .join(
-            F.broadcast(dropoff_zones),
-            df["DOLocationID"] == dropoff_zones["do_location_id"],
-            "left",
-        )
-        .drop("do_location_id")
-    )
-
-
-def filter_date_range(df: DataFrame, year: int, month: int) -> DataFrame:
-    return df.filter(
-        (F.year("tpep_pickup_datetime") == year)
-        & (F.month("tpep_pickup_datetime") == month)
-    )
-
-
-def build_rejection_report(rejected: DataFrame) -> DataFrame:
-    return (
-        rejected
-        .groupBy("rejection_reason")
-        .agg(F.count("*").alias("count"))
-        .orderBy(F.col("count").desc())
-    )
-
-
-def run_silver(
-    spark: SparkSession,
-    year: int,
-    month: int,
-    bronze_path: str = "data/bronze",
-    silver_path: str = "data/silver",
-) -> None:
-    trip_data_path = f"{bronze_path}/year={year}/month={month}/tripdata.parquet"
-    zones_path = f"{bronze_path}/zones/taxi_zone_lookup.csv"
-
-    raw_df = spark.read.parquet(trip_data_path)
-    zones_df = (
-        spark.read
-        .option("header", "true")
-        .option("inferSchema", "true")
-        .csv(zones_path)
-    )
-
-    filtered_df = filter_date_range(raw_df, year, month)
-    valid_df, rejected_df = remove_invalid_trips(filtered_df)
-    enriched_df = add_calculated_columns(valid_df)
-    final_df = join_with_zones(enriched_df, zones_df)
-
-    (
-        final_df
-        .withColumn("pickup_date", F.to_date("tpep_pickup_datetime"))
-        .write
-        .mode("overwrite")
-        .partitionBy("pickup_date")
-        .parquet(f"{silver_path}/trips/year={year}/month={month:02d}")
-    )
-
-    rejection_report = build_rejection_report(rejected_df)
-    (
-        rejection_report
-        .write
-        .mode("overwrite")
-        .option("header", "true")
-        .csv(f"{silver_path}/reports/year={year}/month={month:02d}")
-    )
+    finally:
+        tagged.unpersist()
+    ensure_zone_geojson(settings)
+    return report

@@ -1,232 +1,194 @@
-from pathlib import Path
-from typing import Optional
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from pymongo import MongoClient
+from pymongo.database import Database
+from sqlalchemy import Engine, create_engine
 
-GOLD_PATH = Path(__file__).resolve().parent.parent / "data" / "gold"
+from dashboard import data
+from src.config import get_settings
+from src.domain import DAY_NAMES
 
-
-@st.cache_data
-def load_gold_table(table_name: str) -> Optional[pd.DataFrame]:
-    table_path = GOLD_PATH / table_name
-    if not table_path.exists():
-        return None
-    return pd.read_parquet(table_path)
-
-
-def render_kpi_cards(df: pd.DataFrame) -> None:
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total de Viajes", f"{len(df):,.0f}")
-    col2.metric("Tarifa Promedio", f"${df['avg_fare'].mean():,.2f}")
-    col3.metric("Propina Promedio", f"{df['avg_tip_pct'].mean():,.1f}%")
-    col4.metric("Duración Promedio (min)", f"{df['avg_duration'].mean():,.1f}")
+NYC_CENTER = {"lat": 40.7128, "lon": -73.95}
+CACHE_SECONDS = 600
 
 
-def render_demand_heatmap(df: pd.DataFrame) -> None:
-    day_order = [
-        "Monday", "Tuesday", "Wednesday",
-        "Thursday", "Friday", "Saturday", "Sunday",
-    ]
-    pivot = df.pivot_table(
-        index="day_of_week",
-        columns="pickup_hour",
-        values="trip_count",
-        aggfunc="sum",
-        fill_value=0,
+@st.cache_resource
+def engine() -> Engine:
+    settings = get_settings()
+    return create_engine(
+        f"postgresql+psycopg2://{settings.postgres_user}:{settings.postgres_password}"
+        f"@{settings.postgres_host}:{settings.postgres_port}/{settings.postgres_db}",
+        pool_pre_ping=True,
     )
-    pivot = pivot.reindex([d for d in day_order if d in pivot.index])
-    fig = px.imshow(
-        pivot,
-        labels=dict(x="Hora", y="Día de la Semana", color="Viajes"),
+
+
+@st.cache_resource
+def mongo() -> MongoClient:
+    return MongoClient(get_settings().mongo_uri, serverSelectionTimeoutMS=5000)
+
+
+def database() -> Database:
+    return mongo()[get_settings().mongo_db]
+
+
+@st.cache_data(ttl=CACHE_SECONDS)
+def cached_range() -> tuple[date, date] | None:
+    return data.available_range(engine())
+
+
+@st.cache_data(ttl=CACHE_SECONDS)
+def cached_boroughs() -> list[str]:
+    return data.boroughs(engine())
+
+
+@st.cache_data(ttl=CACHE_SECONDS)
+def cached_summary(desde: date, hasta: date, distritos: tuple[str, ...]) -> pd.DataFrame:
+    return data.summary(engine(), desde, hasta, distritos)
+
+
+@st.cache_data(ttl=CACHE_SECONDS)
+def cached_heatmap(desde: date, hasta: date, distritos: tuple[str, ...]) -> pd.DataFrame:
+    return data.demand_heatmap(engine(), desde, hasta, distritos)
+
+
+@st.cache_data(ttl=CACHE_SECONDS)
+def cached_routes(desde: date, hasta: date, distritos: tuple[str, ...]) -> pd.DataFrame:
+    return data.top_routes(engine(), desde, hasta, distritos)
+
+
+@st.cache_data(ttl=CACHE_SECONDS)
+def cached_geojson() -> dict:
+    return data.zone_geojson(database())
+
+
+@st.cache_data(ttl=CACHE_SECONDS)
+def cached_anomalies(
+    desde: date, hasta: date, distritos: tuple[str, ...]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    db = database()
+    return data.anomalies_by_zone(db, desde, hasta, distritos), data.worst_anomalies(
+        db, desde, hasta, distritos
+    )
+
+
+def _decimal(value: float, digits: int) -> str:
+    return f"{float(value):.{digits}f}".replace(".", ",")
+
+
+def render_summary(frame: pd.DataFrame) -> None:
+    row = frame.iloc[0]
+    columns = st.columns(4)
+    columns[0].metric("Viajes", _decimal((row["viajes"] or 0) / 1_000_000, 2) + " M")
+    columns[1].metric("Importe medio", _decimal(row["importe_medio"] or 0, 2) + " $")
+    columns[2].metric("Propina media", _decimal(row["propina_pct"] or 0, 1) + " %")
+    columns[3].metric("Duración media", _decimal(row["duracion_media_min"] or 0, 1) + " min")
+
+
+def render_heatmap(frame: pd.DataFrame) -> None:
+    grid = (
+        frame.pivot_table(index="dia_semana", columns="hora", values="viajes_medios", fill_value=0)
+        .reindex(index=range(1, 8), columns=range(24), fill_value=0)
+        .rename(index=lambda day: DAY_NAMES[day - 1])
+    )
+    figure = px.imshow(
+        grid,
+        labels={"x": "Hora", "y": "Día", "color": "Viajes por día"},
         aspect="auto",
         color_continuous_scale="YlOrRd",
     )
-    fig.update_layout(title="Demanda por Hora y Día de la Semana")
-    st.plotly_chart(fig, use_container_width=True)
+    figure.update_xaxes(dtick=1)
+    st.plotly_chart(figure, use_container_width=True)
 
 
-def render_top_routes(df: pd.DataFrame) -> None:
-    top = df.nlargest(10, "trip_count")
-    top["route"] = top["pickup_borough"] + " → " + top["dropoff_borough"]
-    fig = px.bar(
-        top,
-        x="trip_count",
-        y="route",
+def render_routes(frame: pd.DataFrame) -> None:
+    frame = frame.assign(trayecto=frame["origen"] + " → " + frame["destino"])
+    figure = px.bar(
+        frame,
+        x="viajes",
+        y="trayecto",
         orientation="h",
-        labels={"trip_count": "Número de Viajes", "route": "Trayecto"},
-        color="trip_count",
-        color_continuous_scale="Blues",
+        color="distrito",
+        hover_data=["duracion_media_min", "importe_medio"],
+        labels={"viajes": "Viajes", "trayecto": "", "distrito": "Distrito"},
     )
-    fig.update_layout(
-        title="Top 10 Trayectos por Volumen",
-        yaxis=dict(autorange="reversed"),
-        showlegend=False,
+    figure.update_layout(yaxis={"autorange": "reversed"}, height=480)
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def render_anomalies(by_zone: pd.DataFrame, worst: pd.DataFrame, geojson: dict) -> None:
+    figure = px.choropleth_mapbox(
+        by_zone,
+        geojson=geojson,
+        locations="zona_id",
+        featureidkey="id",
+        color="anomalias",
+        hover_name="zona",
+        hover_data={"zona_id": False, "importe_por_milla_medio": ":.2f"},
+        color_continuous_scale="OrRd",
+        mapbox_style="open-street-map",
+        center=NYC_CENTER,
+        zoom=9.4,
+        opacity=0.75,
+        labels={"anomalias": "Viajes sospechosos", "importe_por_milla_medio": "$/milla medio"},
     )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def render_anomalies(df: pd.DataFrame) -> None:
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-def apply_filters(
-    df: pd.DataFrame,
-    date_col: str,
-    borough_col: Optional[str],
-    date_range: tuple,
-    selected_boroughs: list[str],
-) -> pd.DataFrame:
-    filtered = df.copy()
-    if date_col in filtered.columns:
-        filtered[date_col] = pd.to_datetime(filtered[date_col], errors="coerce")
-        start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
-        filtered = filtered[
-            (filtered[date_col] >= start) & (filtered[date_col] <= end)
-        ]
-    if borough_col and borough_col in filtered.columns and selected_boroughs:
-        filtered = filtered[filtered[borough_col].isin(selected_boroughs)]
-    return filtered
-
-
-def get_boroughs(dataframes: dict[str, Optional[pd.DataFrame]]) -> list[str]:
-    boroughs: set[str] = set()
-    for df in dataframes.values():
-        if df is None:
-            continue
-        for col in ["pickup_borough", "borough"]:
-            if col in df.columns:
-                boroughs.update(df[col].dropna().unique())
-    return sorted(boroughs)
+    figure.update_layout(height=560, margin={"l": 0, "r": 0, "t": 0, "b": 0})
+    st.plotly_chart(figure, use_container_width=True)
+    st.subheader("Viajes más sospechosos")
+    st.dataframe(worst, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
-    st.set_page_config(
-        page_title="NYC Taxi Data Lake",
-        page_icon="🚕",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Taxis de Nueva York", layout="wide")
+    st.title("Taxis de Nueva York")
 
-    st.title("🚕 NYC Taxi Data Lake - Dashboard")
-
-    demand_df = load_gold_table("demand_by_zone")
-    routes_df = load_gold_table("top_routes")
-    anomalies_df = load_gold_table("anomalies")
-    metrics_df = load_gold_table("monthly_ranking")
-
-    all_tables = {
-        "demand": demand_df,
-        "routes": routes_df,
-        "anomalies": anomalies_df,
-        "metrics": metrics_df,
-    }
-
-    if all(df is None for df in all_tables.values()):
-        st.warning("⚠️ Run the pipeline first to generate data.")
-        st.info(
-            "Ejecuta el pipeline completo para generar los datos de las capas "
-            "bronze → silver → gold antes de usar el dashboard."
-        )
+    period = cached_range()
+    if period is None:
+        st.info("El almacén está vacío. Ejecuta el DAG nyc_taxi_lakehouse en Airflow para cargar un mes.")
         return
 
-    st.sidebar.header("🔍 Filtros")
+    with st.sidebar:
+        st.header("Filtros")
+        selected = st.date_input("Fechas", value=period, min_value=period[0], max_value=period[1])
+        all_boroughs = cached_boroughs()
+        chosen = st.multiselect("Distritos de origen", all_boroughs, default=all_boroughs)
 
-    all_dates: list[pd.Timestamp] = []
-    for df in all_tables.values():
-        if df is None:
-            continue
-        for col in ["pickup_date", "date", "month"]:
-            if col in df.columns:
-                parsed = pd.to_datetime(df[col], errors="coerce").dropna()
-                all_dates.extend(parsed.tolist())
-
-    if all_dates:
-        min_date = min(all_dates).date()
-        max_date = max(all_dates).date()
-    else:
-        from datetime import date
-        min_date = date(2024, 1, 1)
-        max_date = date(2024, 12, 31)
-
-    date_range = st.sidebar.date_input(
-        "Rango de Fechas",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date,
-    )
-
-    if not isinstance(date_range, tuple) or len(date_range) != 2:
-        st.sidebar.warning("Selecciona un rango de fechas válido.")
+    if not isinstance(selected, tuple) or len(selected) != 2:
+        st.warning("Selecciona una fecha inicial y una final.")
         return
+    if not chosen:
+        st.warning("Selecciona al menos un distrito.")
+        return
+    desde, hasta = selected
+    distritos = tuple(sorted(chosen))
 
-    boroughs = get_boroughs(all_tables)
-    selected_boroughs = st.sidebar.multiselect(
-        "Distrito (Borough)",
-        options=boroughs,
-        default=boroughs,
-    )
+    render_summary(cached_summary(desde, hasta, distritos))
+    demand_tab, routes_tab, anomalies_tab = st.tabs(["Demanda", "Trayectos", "Anomalías"])
 
-    tab_demand, tab_routes, tab_anomalies, tab_metrics = st.tabs(
-        ["📊 Demanda por Zona", "🛣️ Top Trayectos", "⚠️ Anomalías", "📈 Métricas"]
-    )
-
-    with tab_demand:
-        if demand_df is not None:
-            filtered = apply_filters(
-                demand_df, "pickup_date", "borough", date_range, selected_boroughs
-            )
-            if filtered.empty:
-                st.info("No hay datos para los filtros seleccionados.")
-            else:
-                render_demand_heatmap(filtered)
+    with demand_tab:
+        st.subheader("Viajes medios por día de la semana y hora")
+        heatmap = cached_heatmap(desde, hasta, distritos)
+        if heatmap.empty:
+            st.info("No hay viajes para los filtros seleccionados.")
         else:
-            st.info("Tabla de demanda por zona no disponible. Ejecuta el pipeline primero.")
+            render_heatmap(heatmap)
 
-    with tab_routes:
-        if routes_df is not None:
-            filtered = apply_filters(
-                routes_df, "pickup_date", "pickup_borough", date_range, selected_boroughs
-            )
-            if filtered.empty:
-                st.info("No hay datos para los filtros seleccionados.")
-            else:
-                render_top_routes(filtered)
+    with routes_tab:
+        st.subheader("Los 10 trayectos con más viajes")
+        routes = cached_routes(desde, hasta, distritos)
+        if routes.empty:
+            st.info("No hay trayectos para los filtros seleccionados.")
         else:
-            st.info("Tabla de trayectos no disponible. Ejecuta el pipeline primero.")
+            render_routes(routes)
 
-    with tab_anomalies:
-        if anomalies_df is not None:
-            filtered = apply_filters(
-                anomalies_df, "pickup_date", "pickup_borough", date_range, selected_boroughs
-            )
-            if filtered.empty:
-                st.info("No hay anomalías para los filtros seleccionados.")
-            else:
-                st.subheader(f"🔍 {len(filtered)} viajes anómalos detectados")
-                render_anomalies(filtered)
+    with anomalies_tab:
+        by_zone, worst = cached_anomalies(desde, hasta, distritos)
+        if by_zone.empty:
+            st.info("No hay viajes sospechosos para los filtros seleccionados.")
         else:
-            st.info("Tabla de anomalías no disponible. Ejecuta el pipeline primero.")
-
-    with tab_metrics:
-        if metrics_df is not None:
-            filtered = apply_filters(
-                metrics_df, "month", "borough", date_range, selected_boroughs
-            )
-            if filtered.empty:
-                st.info("No hay métricas para los filtros seleccionados.")
-            else:
-                required_cols = {"avg_fare", "avg_tip_pct", "avg_duration"}
-                if required_cols.issubset(set(filtered.columns)):
-                    render_kpi_cards(filtered)
-                    st.divider()
-                st.dataframe(filtered, use_container_width=True, hide_index=True)
-        else:
-            st.info("Tabla de métricas no disponible. Ejecuta el pipeline primero.")
+            render_anomalies(by_zone, worst, cached_geojson())
 
 
 if __name__ == "__main__":

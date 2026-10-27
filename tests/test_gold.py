@@ -1,156 +1,160 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pyspark.sql import SparkSession
-from pyspark.sql.types import (
-    BooleanType,
-    DoubleType,
-    IntegerType,
-    StringType,
-    StructField,
-    StructType,
-    TimestampType,
-)
 
 from src.transform.gold import (
-    demand_by_zone_and_hour,
+    demand_by_zone_hour,
     detect_anomalies,
+    monthly_zone_ranking,
     top_routes_by_borough,
+    travel_time_between_zones,
+    trips_aggregated,
 )
+from tests.factories import BASE_PICKUP, silver_trip, silver_trips, trip_key
+
+MORNING = datetime(2024, 1, 16, 8, 0)
 
 
-SILVER_SCHEMA = StructType([
-    StructField("VendorID", IntegerType(), False),
-    StructField("tpep_pickup_datetime", TimestampType(), False),
-    StructField("tpep_dropoff_datetime", TimestampType(), False),
-    StructField("passenger_count", IntegerType(), True),
-    StructField("trip_distance", DoubleType(), False),
-    StructField("PULocationID", IntegerType(), False),
-    StructField("DOLocationID", IntegerType(), False),
-    StructField("fare_amount", DoubleType(), False),
-    StructField("tip_amount", DoubleType(), False),
-    StructField("total_amount", DoubleType(), False),
-    StructField("duration_minutes", DoubleType(), False),
-    StructField("avg_speed_mph", DoubleType(), False),
-    StructField("tip_percentage", DoubleType(), False),
-    StructField("time_slot", StringType(), False),
-    StructField("day_of_week", StringType(), False),
-    StructField("is_holiday", BooleanType(), False),
-    StructField("pickup_zone", StringType(), False),
-    StructField("pickup_borough", StringType(), False),
-    StructField("dropoff_zone", StringType(), False),
-    StructField("dropoff_borough", StringType(), False),
-])
+def _trips_on_route(count: int, start: datetime = MORNING, **overrides: object) -> list[dict]:
+    return [
+        silver_trip(
+            pickup=start + timedelta(minutes=index), trip_id=f"{start}-{overrides}-{index}", **overrides
+        )
+        for index in range(count)
+    ]
 
 
-def _silver_row(overrides: dict | None = None) -> dict:
-    defaults = {
-        "VendorID": 1,
-        "tpep_pickup_datetime": datetime(2024, 1, 15, 10, 0, 0),
-        "tpep_dropoff_datetime": datetime(2024, 1, 15, 10, 30, 0),
-        "passenger_count": 1,
-        "trip_distance": 5.0,
-        "PULocationID": 100,
-        "DOLocationID": 200,
-        "fare_amount": 25.0,
-        "tip_amount": 5.0,
-        "total_amount": 30.0,
-        "duration_minutes": 30.0,
-        "avg_speed_mph": 10.0,
-        "tip_percentage": 20.0,
-        "time_slot": "MAÑANA",
-        "day_of_week": "Monday",
-        "is_holiday": False,
-        "pickup_zone": "ZoneA",
-        "pickup_borough": "Manhattan",
-        "dropoff_zone": "ZoneB",
-        "dropoff_borough": "Brooklyn",
+def test_demand_by_zone_hour(spark: SparkSession) -> None:
+    trips = silver_trips(
+        spark,
+        [
+            silver_trip(trip_id="a", pickup=datetime(2024, 1, 16, 8, 5), total_amount=10.0, tip_pct=10.0),
+            silver_trip(trip_id="b", pickup=datetime(2024, 1, 16, 8, 40), total_amount=30.0, tip_pct=None),
+            silver_trip(trip_id="c", pickup=datetime(2024, 1, 16, 9, 10), total_amount=20.0),
+            silver_trip(trip_id="d", pickup=datetime(2024, 1, 16, 8, 15), pickup_location_id=132),
+        ],
+    )
+    rows = {
+        (row["pickup_location_id"], row["pickup_hour"]): row for row in demand_by_zone_hour(trips).collect()
     }
-    if overrides:
-        defaults.update(overrides)
-    return defaults
+    eight = rows[(161, 8)]
+    assert eight["trips"] == 2
+    assert eight["avg_total_amount"] == 20.0
+    assert eight["avg_tip_pct"] == 10.0
+    assert eight["tip_pct_count"] == 1
+    assert rows[(161, 9)]["trips"] == 1
+    assert rows[(132, 8)]["trips"] == 1
 
 
-def test_demand_counts_trips_per_zone_hour(spark: SparkSession) -> None:
-    rows = []
-    for i in range(3):
-        rows.append(_silver_row({
-            "pickup_zone": "ZoneA",
-            "tpep_pickup_datetime": datetime(2024, 1, 15, 10, i, 0),
-            "tpep_dropoff_datetime": datetime(2024, 1, 15, 10, 30 + i, 0),
-            "PULocationID": 100 + i,
-        }))
-    for i in range(2):
-        rows.append(_silver_row({
-            "pickup_zone": "ZoneB",
-            "tpep_pickup_datetime": datetime(2024, 1, 15, 14, i, 0),
-            "tpep_dropoff_datetime": datetime(2024, 1, 15, 14, 30 + i, 0),
-            "PULocationID": 200 + i,
-        }))
+def test_top_routes_keeps_n_per_borough_ordered(spark: SparkSession) -> None:
+    trips = []
+    for destination in range(1, 13):
+        trips += _trips_on_route(destination, dropoff_location_id=destination)
+    trips += _trips_on_route(3, pickup_location_id=132, pickup_borough="Queens", dropoff_location_id=1)
+    result = top_routes_by_borough(silver_trips(spark, trips), n=10)
 
-    df = spark.createDataFrame(rows, schema=SILVER_SCHEMA)
-    result = demand_by_zone_and_hour(df)
+    manhattan = result.filter("pickup_borough = 'Manhattan'").orderBy("rank").collect()
+    assert len(manhattan) == 10
+    assert [row["dropoff_location_id"] for row in manhattan[:3]] == [12, 11, 10]
+    assert [row["rank"] for row in manhattan] == list(range(1, 11))
+    assert result.filter("pickup_borough = 'Queens'").count() == 1
 
-    result_map = {
-        (row["pickup_zone"], row["hour"]): row["trip_count"]
-        for row in result.collect()
+
+def test_travel_time_by_slot(spark: SparkSession) -> None:
+    trips = silver_trips(
+        spark,
+        [
+            silver_trip(trip_id="a", minutes=20.0, time_slot="punta_manana"),
+            silver_trip(trip_id="b", minutes=40.0, time_slot="punta_manana"),
+            silver_trip(trip_id="c", minutes=12.0, time_slot="noche", pickup=datetime(2024, 1, 16, 22)),
+        ],
+    )
+    rows = {row["time_slot"]: row for row in travel_time_between_zones(trips).collect()}
+    assert rows["punta_manana"]["avg_duration_minutes"] == 30.0
+    assert rows["punta_manana"]["trips"] == 2
+    assert rows["noche"]["avg_duration_minutes"] == 12.0
+
+
+def test_trips_aggregated_sums_measures(spark: SparkSession) -> None:
+    trips = silver_trips(
+        spark,
+        [
+            silver_trip(trip_id="a", passenger_count=2, tip_amount=3.0),
+            silver_trip(
+                trip_id="b", passenger_count=1, tip_amount=1.0, pickup=BASE_PICKUP.replace(minute=30)
+            ),
+        ],
+    )
+    row = trips_aggregated(trips).first()
+    assert row["trips"] == 2
+    assert row["passengers"] == 3
+    assert row["tip_amount_sum"] == 4.0
+
+
+def _monthly(spark: SparkSession, rows: list[tuple]) -> object:
+    return spark.createDataFrame(
+        rows,
+        "year_month string, pickup_borough string, pickup_location_id int, pickup_zone string, trips long",
+    )
+
+
+def test_monthly_ranking_top3_and_variation(spark: SparkSession) -> None:
+    demand = _monthly(
+        spark,
+        [
+            ("2024-01", "Manhattan", 1, "A", 100),
+            ("2024-01", "Manhattan", 2, "B", 90),
+            ("2024-01", "Manhattan", 3, "C", 80),
+            ("2024-01", "Manhattan", 4, "D", 70),
+            ("2024-02", "Manhattan", 1, "A", 50),
+            ("2024-02", "Manhattan", 2, "B", 95),
+            ("2024-02", "Manhattan", 3, "C", 10),
+            ("2024-02", "Manhattan", 4, "D", 140),
+            ("2024-02", "Manhattan", 5, "E", 60),
+        ],
+    )
+    february = {
+        row["pickup_location_id"]: row
+        for row in monthly_zone_ranking(demand).filter("year_month = '2024-02'").collect()
     }
-    assert result_map[("ZoneA", 10)] == 3
-    assert result_map[("ZoneB", 14)] == 2
+    assert sorted(february) == [2, 4, 5]
+    assert february[4]["rank"] == 1
+    assert february[4]["variation_pct"] == 100.0
+    assert february[2]["variation_pct"] == round((95 - 90) / 90 * 100, 2)
+    assert february[5]["previous_month_trips"] is None
 
 
-def test_top_routes_returns_correct_number(spark: SparkSession) -> None:
-    rows = []
-    for i in range(15):
-        for j in range(i + 1):
-            rows.append(_silver_row({
-                "pickup_zone": f"PU_{i}",
-                "dropoff_zone": f"DO_{i}",
-                "pickup_borough": "Manhattan",
-                "dropoff_borough": "Manhattan",
-                "PULocationID": i,
-                "DOLocationID": i + 100,
-                "tpep_pickup_datetime": datetime(2024, 1, 15, 10, j % 60, 0),
-                "tpep_dropoff_datetime": datetime(2024, 1, 15, 10, 30 + (j % 30), 0),
-            }))
-
-    df = spark.createDataFrame(rows, schema=SILVER_SCHEMA)
-    result = top_routes_by_borough(df, top_n=5)
-
-    manhattan_routes = result.filter(result["pickup_borough"] == "Manhattan")
-    assert manhattan_routes.count() == 5
+def test_monthly_ranking_ignores_non_consecutive_months(spark: SparkSession) -> None:
+    demand = _monthly(
+        spark,
+        [
+            ("2024-01", "Queens", 7, "X", 10),
+            ("2024-03", "Queens", 7, "X", 20),
+        ],
+    )
+    march = monthly_zone_ranking(demand).filter("year_month = '2024-03'").first()
+    assert march["previous_month_trips"] is None
+    assert march["variation_pct"] is None
 
 
-def test_anomaly_detection_flags_outliers(spark: SparkSession) -> None:
-    rows = []
-    for i in range(10):
-        rows.append(_silver_row({
-            "pickup_zone": "ZoneA",
-            "dropoff_zone": "ZoneB",
-            "trip_distance": 5.0,
-            "fare_amount": 25.0,
-            "PULocationID": 1,
-            "DOLocationID": 2,
-            "tpep_pickup_datetime": datetime(2024, 1, 15, 10, i, 0),
-            "tpep_dropoff_datetime": datetime(2024, 1, 15, 10, 30 + i, 0),
-        }))
+def test_anomaly_detection_flags_expensive_trip(spark: SparkSession) -> None:
+    trips = [
+        silver_trip(
+            trip_id=f"normal-{index}",
+            pickup=MORNING + timedelta(minutes=index),
+            fare_amount=20.0 + (index % 5),
+            trip_distance=5.0,
+        )
+        for index in range(40)
+    ]
+    trips.append(silver_trip(trip_id="outlier", pickup=MORNING, fare_amount=250.0, trip_distance=5.0))
+    anomalies = detect_anomalies(silver_trips(spark, trips)).collect()
+    assert [row["trip_id"] for row in anomalies] == [trip_key("outlier")]
+    assert anomalies[0]["z_score"] > 3
+    assert anomalies[0]["route_trips"] == 41
 
-    rows.append(_silver_row({
-        "pickup_zone": "ZoneA",
-        "dropoff_zone": "ZoneB",
-        "trip_distance": 5.0,
-        "fare_amount": 250.0,
-        "total_amount": 260.0,
-        "PULocationID": 1,
-        "DOLocationID": 2,
-        "tpep_pickup_datetime": datetime(2024, 1, 15, 11, 0, 0),
-        "tpep_dropoff_datetime": datetime(2024, 1, 15, 11, 30, 0),
-    }))
 
-    df = spark.createDataFrame(rows, schema=SILVER_SCHEMA)
-    result = detect_anomalies(df)
-
-    anomalies = result.filter(result["is_anomaly"] == True)
-    assert anomalies.count() >= 1
-
-    anomaly_row = anomalies.collect()[0]
-    assert anomaly_row["fare_amount"] == 250.0
+def test_anomaly_detection_needs_enough_route_trips(spark: SparkSession) -> None:
+    trips = [silver_trip(trip_id=f"t{index}", fare_amount=20.0 + index) for index in range(10)]
+    trips.append(silver_trip(trip_id="outlier", fare_amount=500.0))
+    assert detect_anomalies(silver_trips(spark, trips)).count() == 0
